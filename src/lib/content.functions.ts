@@ -1,0 +1,508 @@
+import { createServerFn } from "@tanstack/react-start";
+import { z } from "zod";
+import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import { enforceRateLimit } from "@/lib/rate-limit.server";
+import { siteContentSchema, type SiteContent } from "@/lib/site-content";
+
+const BUCKET = "moments";
+const RESUME_BUCKET = "resume";
+
+// ---------- TYPES ----------
+export type About = {
+  id: string;
+  name: string;
+  initials: string;
+  tagline: string;
+  long_bio: string;
+  location: string;
+  email: string;
+  github_url: string;
+  linkedin_url: string;
+  resume_url: string;
+  current_focus: string | null;
+  site_content?: SiteContent;
+  resume_reference?: string;
+};
+export type Project = {
+  id: string;
+  name: string;
+  description: string;
+  stack: string[];
+  categories: string[];
+  github_url: string | null;
+  live_url: string | null;
+  year: string | null;
+  featured: boolean;
+  sort_order: number;
+  problem: string | null;
+  solution: string | null;
+  features: string[];
+  challenges: string | null;
+  learning: string | null;
+  status: string;
+};
+export type Experience = {
+  id: string;
+  title: string;
+  org: string;
+  period: string;
+  detail: string;
+  kind: "edu" | "exp";
+  sort_order: number;
+};
+export type SkillsGroup = { id: string; name: string; items: string[]; sort_order: number };
+export type Moment = {
+  id: string;
+  title: string;
+  event_date: string | null;
+  caption: string | null;
+  image_path: string;
+  url: string | null;
+  sort_order: number;
+  category: string | null;
+  location: string | null;
+};
+export type Achievement = {
+  id: string;
+  title: string;
+  org: string | null;
+  period: string | null;
+  detail: string | null;
+  sort_order: number;
+};
+
+// ---------- PUBLIC FETCH ----------
+export const getPortfolio = createServerFn({ method: "GET" }).handler(async () => {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+  const [aboutQ, projectsQ, expQ, skillsQ, momentsQ, achievementsQ] = await Promise.all([
+    supabaseAdmin.from("about_profile").select("*").limit(1).maybeSingle(),
+    supabaseAdmin.from("projects").select("*").order("sort_order", { ascending: true }),
+    supabaseAdmin.from("experiences").select("*").order("sort_order", { ascending: true }),
+    supabaseAdmin.from("skills_groups").select("*").order("sort_order", { ascending: true }),
+    supabaseAdmin
+      .from("moments")
+      .select("*")
+      .order("sort_order", { ascending: true })
+      .order("created_at", { ascending: false }),
+    supabaseAdmin.from("achievements").select("*").order("sort_order", { ascending: true }),
+  ]);
+
+  for (const result of [aboutQ, projectsQ, expQ, skillsQ, momentsQ, achievementsQ]) {
+    if (result.error) throw new Error(`Portfolio content could not be loaded: ${result.error.message}`);
+  }
+
+  const moments: Moment[] = await Promise.all(
+    (momentsQ.data ?? []).map(async (m: any) => {
+      const { data: signed } = await supabaseAdmin.storage
+        .from(BUCKET)
+        .createSignedUrl(m.image_path, 60 * 60 * 6);
+      return { ...m, url: signed?.signedUrl ?? null } as Moment;
+    }),
+  );
+
+  let about = (aboutQ.data ?? null) as About | null;
+  if (about) about = { ...about, resume_reference: about.resume_url };
+  if (about?.resume_url?.startsWith("storage:")) {
+    const path = about.resume_url.slice("storage:".length);
+    const { data: signed } = await supabaseAdmin.storage
+      .from(RESUME_BUCKET)
+      .createSignedUrl(path, 60 * 60 * 6);
+    about = { ...about, resume_url: signed?.signedUrl ?? "#" };
+  }
+
+  return {
+    about,
+    projects: (projectsQ.data ?? []) as Project[],
+    experiences: (expQ.data ?? []) as Experience[],
+    skills: (skillsQ.data ?? []) as SkillsGroup[],
+    achievements: (achievementsQ.data ?? []) as Achievement[],
+    moments,
+  };
+});
+
+// ---------- RESUME UPLOAD ----------
+const resumeInput = z.object({
+  id: z.string().uuid(),
+  file_base64: z.string().min(10),
+  content_type: z.string().min(3).max(120),
+  filename: z.string().min(1).max(200),
+});
+
+export const uploadResume = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((d: z.infer<typeof resumeInput>) => resumeInput.parse(d))
+  .handler(async ({ data, context }) => {
+    await assertAdmin(context.supabase, context.claims, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const bin = Buffer.from(data.file_base64, "base64");
+    const safe = data.filename.replace(/[^a-zA-Z0-9._-]/g, "_");
+    const path = `${Date.now()}-${safe}`;
+    const { error: upErr } = await supabaseAdmin.storage
+      .from(RESUME_BUCKET)
+      .upload(path, bin, { contentType: data.content_type || "application/pdf", upsert: false });
+    if (upErr) throw new Error(upErr.message);
+    const { error } = await supabaseAdmin
+      .from("about_profile")
+      .update({ resume_url: `storage:${path}` })
+      .eq("id", data.id);
+    if (error) throw new Error(error.message);
+    return { ok: true as const };
+  });
+
+// ---------- ADMIN HELPER ----------
+async function resolveUserEmail(claims: any, userId: string): Promise<string | null> {
+  const fromClaims = (claims?.email as string | undefined)?.toLowerCase();
+  if (fromClaims) return fromClaims;
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const { data } = await supabaseAdmin.auth.admin.getUserById(userId);
+  return data?.user?.email?.toLowerCase() ?? null;
+}
+
+async function isAllowlistedEmail(email: string): Promise<boolean> {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const { data } = await supabaseAdmin
+    .from("admin_emails")
+    .select("email")
+    .ilike("email", email)
+    .maybeSingle();
+  return !!data;
+}
+
+async function assertAdmin(_supabase: any, claims?: any, userId?: string) {
+  enforceRateLimit("admin");
+  const email = await resolveUserEmail(claims, userId ?? "");
+  if (!email || !(await isAllowlistedEmail(email))) throw new Error("Forbidden: admin only");
+}
+
+// ---------- ABOUT ----------
+export const updateAbout = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((d: Partial<About> & { id: string }) =>
+    z
+      .object({
+        id: z.string().uuid(),
+        name: z.string().min(1).max(120).optional(),
+        initials: z.string().min(1).max(8).optional(),
+        tagline: z.string().min(1).max(280).optional(),
+        long_bio: z.string().min(1).max(2000).optional(),
+        location: z.string().min(1).max(200).optional(),
+        email: z.string().email().optional(),
+        github_url: z.string().url().optional(),
+        linkedin_url: z.string().url().optional(),
+        resume_url: z.string().min(1).max(500).optional(),
+        current_focus: z.string().max(200).nullable().optional(),
+        site_content: siteContentSchema.optional(),
+      })
+      .parse(d),
+  )
+  .handler(async ({ data, context }) => {
+    const { supabase } = context;
+    await assertAdmin(supabase, context.claims, context.userId);
+    const { id, ...patch } = data;
+    const { error } = await supabase.from("about_profile").update(patch).eq("id", id);
+    if (error) throw new Error(error.message);
+    return { ok: true as const };
+  });
+
+// ---------- PROJECTS ----------
+const projectInput = z.object({
+  id: z.string().uuid().optional(),
+  name: z.string().min(1).max(120),
+  description: z.string().min(1).max(1500),
+  stack: z.array(z.string().min(1).max(40)).max(20),
+  categories: z.array(z.string().min(1).max(40)).max(8),
+  github_url: z.string().url().nullable().optional(),
+  live_url: z.string().url().nullable().optional(),
+  year: z.string().max(20).nullable().optional(),
+  featured: z.boolean().optional(),
+  sort_order: z.number().int().optional(),
+  problem: z.string().max(2000).nullable().optional(),
+  solution: z.string().max(2000).nullable().optional(),
+  features: z.array(z.string().min(1).max(200)).max(20).optional(),
+  challenges: z.string().max(2000).nullable().optional(),
+  learning: z.string().max(2000).nullable().optional(),
+  status: z.enum(["shipped", "building", "concept"]).optional(),
+});
+
+export const upsertProject = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((d: z.infer<typeof projectInput>) => projectInput.parse(d))
+  .handler(async ({ data, context }) => {
+    const { supabase } = context;
+    await assertAdmin(supabase, context.claims, context.userId);
+    const payload = {
+      ...data,
+      github_url: data.github_url || null,
+      live_url: data.live_url || null,
+      year: data.year || null,
+      featured: data.featured ?? false,
+      sort_order: data.sort_order ?? 999,
+      problem: data.problem || null,
+      solution: data.solution || null,
+      features: data.features ?? [],
+      challenges: data.challenges || null,
+      learning: data.learning || null,
+      status: data.status ?? "shipped",
+    };
+    const { error } = data.id
+      ? await supabase.from("projects").update(payload).eq("id", data.id)
+      : await supabase.from("projects").insert(payload);
+    if (error) throw new Error(error.message);
+    return { ok: true as const };
+  });
+
+export const deleteProject = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((d: { id: string }) => z.object({ id: z.string().uuid() }).parse(d))
+  .handler(async ({ data, context }) => {
+    await assertAdmin(context.supabase, context.claims, context.userId);
+    const { error } = await context.supabase.from("projects").delete().eq("id", data.id);
+    if (error) throw new Error(error.message);
+    return { ok: true as const };
+  });
+
+// ---------- EXPERIENCES ----------
+const expInput = z.object({
+  id: z.string().uuid().optional(),
+  title: z.string().min(1).max(160),
+  org: z.string().min(1).max(160),
+  period: z.string().min(1).max(80),
+  detail: z.string().min(1).max(1000),
+  kind: z.enum(["edu", "exp"]),
+  sort_order: z.number().int().optional(),
+});
+
+export const upsertExperience = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((d: z.infer<typeof expInput>) => expInput.parse(d))
+  .handler(async ({ data, context }) => {
+    await assertAdmin(context.supabase, context.claims, context.userId);
+    const payload = { ...data, sort_order: data.sort_order ?? 999 };
+    const { error } = data.id
+      ? await context.supabase.from("experiences").update(payload).eq("id", data.id)
+      : await context.supabase.from("experiences").insert(payload);
+    if (error) throw new Error(error.message);
+    return { ok: true as const };
+  });
+
+export const deleteExperience = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((d: { id: string }) => z.object({ id: z.string().uuid() }).parse(d))
+  .handler(async ({ data, context }) => {
+    await assertAdmin(context.supabase, context.claims, context.userId);
+    const { error } = await context.supabase.from("experiences").delete().eq("id", data.id);
+    if (error) throw new Error(error.message);
+    return { ok: true as const };
+  });
+
+// ---------- SKILLS ----------
+const skillInput = z.object({
+  id: z.string().uuid().optional(),
+  name: z.string().min(1).max(60),
+  items: z.array(z.string().min(1).max(40)).max(40),
+  sort_order: z.number().int().optional(),
+});
+
+export const upsertSkillGroup = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((d: z.infer<typeof skillInput>) => skillInput.parse(d))
+  .handler(async ({ data, context }) => {
+    await assertAdmin(context.supabase, context.claims, context.userId);
+    const payload = { ...data, sort_order: data.sort_order ?? 999 };
+    const { error } = data.id
+      ? await context.supabase.from("skills_groups").update(payload).eq("id", data.id)
+      : await context.supabase.from("skills_groups").insert(payload);
+    if (error) throw new Error(error.message);
+    return { ok: true as const };
+  });
+
+export const deleteSkillGroup = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((d: { id: string }) => z.object({ id: z.string().uuid() }).parse(d))
+  .handler(async ({ data, context }) => {
+    await assertAdmin(context.supabase, context.claims, context.userId);
+    const { error } = await context.supabase.from("skills_groups").delete().eq("id", data.id);
+    if (error) throw new Error(error.message);
+    return { ok: true as const };
+  });
+
+// ---------- MOMENTS ----------
+const momentInput = z.object({
+  title: z.string().min(1).max(200),
+  event_date: z.string().nullable().optional(),
+  caption: z.string().max(500).nullable().optional(),
+  image_base64: z.string().min(10),
+  content_type: z.string().regex(/^image\//),
+  filename: z.string().min(1).max(200),
+  sort_order: z.number().int().optional(),
+  category: z.string().max(60).nullable().optional(),
+  location: z.string().max(120).nullable().optional(),
+});
+
+export const createMoment = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((d: z.infer<typeof momentInput>) => momentInput.parse(d))
+  .handler(async ({ data, context }) => {
+    await assertAdmin(context.supabase, context.claims, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const bin = Buffer.from(data.image_base64, "base64");
+    const safe = data.filename.replace(/[^a-zA-Z0-9._-]/g, "_");
+    const path = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${safe}`;
+    const { error: upErr } = await supabaseAdmin.storage
+      .from(BUCKET)
+      .upload(path, bin, { contentType: data.content_type, upsert: false });
+    if (upErr) throw new Error(upErr.message);
+    const { error } = await supabaseAdmin.from("moments").insert({
+      title: data.title,
+      event_date: data.event_date || null,
+      caption: data.caption || null,
+      image_path: path,
+      sort_order: data.sort_order ?? 999,
+      category: data.category || null,
+      location: data.location || null,
+    });
+    if (error) throw new Error(error.message);
+    return { ok: true as const };
+  });
+
+export const deleteMoment = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((d: { id: string }) => z.object({ id: z.string().uuid() }).parse(d))
+  .handler(async ({ data, context }) => {
+    await assertAdmin(context.supabase, context.claims, context.userId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: row } = await supabaseAdmin
+      .from("moments")
+      .select("image_path")
+      .eq("id", data.id)
+      .single();
+    if (row?.image_path) await supabaseAdmin.storage.from(BUCKET).remove([row.image_path]);
+    const { error } = await supabaseAdmin.from("moments").delete().eq("id", data.id);
+    if (error) throw new Error(error.message);
+    return { ok: true as const };
+  });
+
+const momentUpdateInput = z.object({
+  id: z.string().uuid(), title: z.string().trim().min(1).max(200),
+  event_date: z.string().nullable().optional(), caption: z.string().max(500).nullable().optional(),
+  category: z.string().max(60).nullable().optional(), location: z.string().max(120).nullable().optional(),
+  sort_order: z.number().int().optional(),
+  image_base64: z.string().optional(), content_type: z.string().regex(/^image\//).optional(), filename: z.string().max(200).optional(),
+});
+export const updateMoment = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((d: z.infer<typeof momentUpdateInput>) => momentUpdateInput.parse(d))
+  .handler(async ({ data, context }) => {
+    await assertAdmin(context.supabase, context.claims, context.userId);
+    const { id, image_base64, content_type, filename, ...patch } = data;
+    let imagePath: string | undefined;
+    if (image_base64 && content_type && filename) {
+      const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+      imagePath = `${crypto.randomUUID()}-${filename.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
+      const { error } = await supabaseAdmin.storage.from(BUCKET).upload(imagePath, Buffer.from(image_base64, "base64"), { contentType: content_type });
+      if (error) throw new Error(error.message);
+    }
+    const { error } = await context.supabase.from("moments").update({ ...patch, ...(imagePath ? { image_path: imagePath } : {}) }).eq("id", id).select("id").single();
+    if (error) throw new Error(error.message);
+    return { ok: true as const };
+  });
+
+// ---------- ACHIEVEMENTS ----------
+const achievementInput = z.object({
+  id: z.string().uuid().optional(),
+  title: z.string().min(1).max(200),
+  org: z.string().max(160).nullable().optional(),
+  period: z.string().max(80).nullable().optional(),
+  detail: z.string().max(1000).nullable().optional(),
+  sort_order: z.number().int().optional(),
+});
+
+export const upsertAchievement = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((d: z.infer<typeof achievementInput>) => achievementInput.parse(d))
+  .handler(async ({ data, context }) => {
+    await assertAdmin(context.supabase, context.claims, context.userId);
+    const payload = {
+      ...data,
+      org: data.org || null,
+      period: data.period || null,
+      detail: data.detail || null,
+      sort_order: data.sort_order ?? 999,
+    };
+    const { error } = data.id
+      ? await context.supabase.from("achievements").update(payload).eq("id", data.id)
+      : await context.supabase.from("achievements").insert(payload);
+    if (error) throw new Error(error.message);
+    return { ok: true as const };
+  });
+
+export const deleteAchievement = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((d: { id: string }) => z.object({ id: z.string().uuid() }).parse(d))
+  .handler(async ({ data, context }) => {
+    await assertAdmin(context.supabase, context.claims, context.userId);
+    const { error } = await context.supabase.from("achievements").delete().eq("id", data.id);
+    if (error) throw new Error(error.message);
+    return { ok: true as const };
+  });
+
+export const checkIsAdmin = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    const email = await resolveUserEmail(context.claims, context.userId);
+    if (!email) return { isAdmin: false };
+    return { isAdmin: await isAllowlistedEmail(email) };
+  });
+
+// ---------- CONTACT MESSAGES ----------
+export type ContactMessage = {
+  id: string;
+  name: string;
+  email: string;
+  message: string;
+  is_read: boolean;
+  created_at: string;
+};
+
+const contactInput = z.object({
+  name: z.string().trim().min(1).max(100),
+  email: z.string().trim().email().max(255),
+  message: z.string().trim().min(1).max(2000),
+});
+
+export const submitContactMessage = createServerFn({ method: "POST" })
+  .inputValidator((d: z.infer<typeof contactInput>) => contactInput.parse(d))
+  .handler(async ({ data }) => {
+    enforceRateLimit("contact");
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { error } = await supabaseAdmin.from("contact_messages").insert({
+      name: data.name,
+      email: data.email,
+      message: data.message,
+    });
+    if (error) throw new Error(error.message);
+    return { ok: true as const };
+  });
+
+export const listContactMessages = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    await assertAdmin(context.supabase, context.claims, context.userId);
+    const { data, error } = await context.supabase
+      .from("contact_messages")
+      .select("*")
+      .order("created_at", { ascending: false });
+    if (error) throw new Error(error.message);
+    return (data ?? []) as ContactMessage[];
+  });
+
+export const deleteContactMessage = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((d: { id: string }) => z.object({ id: z.string().uuid() }).parse(d))
+  .handler(async ({ data, context }) => {
+    await assertAdmin(context.supabase, context.claims, context.userId);
+    const { error } = await context.supabase.from("contact_messages").delete().eq("id", data.id);
+    if (error) throw new Error(error.message);
+    return { ok: true as const };
+  });
